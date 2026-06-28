@@ -189,38 +189,85 @@ if ($PythonCmd) {
             exit 1
         }
 
-        Write-Step "Installing Python $PythonVersion silently"
-        # InstallAllUsers=1 needs elevation; fall back to per-user if not admin.
+        # Install to a FIXED, known location instead of the installer's
+        # default (which varies between per-user/per-machine and between
+        # Windows versions). Knowing the exact path lets us verify the
+        # install actually completed by checking the filesystem directly,
+        # rather than trusting PATH - which is the part that was failing.
         if ($IsAdmin) {
-            $installArgs = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0"
+            $TargetDir = "C:\Python$($PythonVersion -replace '\.','')"
+            $installArgs = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 TargetDir=`"$TargetDir`""
         } else {
             Write-Host "    Not running elevated - installing for current user only." -ForegroundColor Yellow
-            $installArgs = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0"
+            $TargetDir = "$env:LOCALAPPDATA\Programs\Python\Python$($PythonVersion -replace '\.','')"
+            $installArgs = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 TargetDir=`"$TargetDir`""
         }
 
+        Write-Step "Installing Python $PythonVersion silently to $TargetDir"
         $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -Wait -PassThru
         if ($proc.ExitCode -ne 0) {
             Write-Fail "Python installer exited with code $($proc.ExitCode)."
             exit 1
         }
-        Write-Ok "Python installed"
 
-        # Refresh PATH in this process so we can find the new install
-        # without needing to open a new PowerShell window.
+        # The installer .exe can return before its internal MSI sub-install
+        # has actually finished writing files (a known quirk with this
+        # installer). Poll the filesystem for python.exe directly, rather
+        # than trusting the exit code or PATH, with a generous timeout.
+        $expectedExe = Join-Path $TargetDir "python.exe"
+        Write-Step "Waiting for $expectedExe to appear on disk"
+        $deadline = (Get-Date).AddSeconds(120)
+        while (-not (Test-Path $expectedExe) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+        }
+
+        if (-not (Test-Path $expectedExe)) {
+            Write-Fail "python.exe did not appear at $expectedExe within 2 minutes of install finishing."
+            Write-Host "    The installer reported success but the file isn't there yet (or installed elsewhere)." -ForegroundColor Yellow
+            Write-Host "    Check Programs and Features / Apps to see if Python actually installed, and where." -ForegroundColor Yellow
+            exit 1
+        }
+        Write-Ok "Confirmed python.exe exists at $expectedExe"
+
+        # Use the FULL PATH directly for the rest of THIS script run.
+        # This deliberately bypasses PATH/$env:Path entirely, because
+        # PowerShell caches environment variables for the life of the
+        # session - a freshly-written registry PATH value is not
+        # guaranteed to be visible in this process no matter how we
+        # try to refresh it. A new PATH entry only reliably takes
+        # effect in a NEW PowerShell window, but we don't want this
+        # script to require that, so we just use the known full path.
+        $PythonCmd = $expectedExe
+
+        Remove-Item $installerPath -ErrorAction SilentlyContinue
+    } else {
+        # winget path: re-detect via PATH as before, since winget
+        # typically installs through the Store/App Execution Alias
+        # mechanism rather than a fixed directory we can predict.
         $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
         $env:Path = "$machinePath;$userPath"
-
-        Remove-Item $installerPath -ErrorAction SilentlyContinue
     }
 
-    # Re-check for Python now that something was installed
-    Write-Step "Re-checking for Python after install"
-    $PythonCmd = Find-RealPython
+    # Re-check for Python now that something was installed.
+    # (If we just set $PythonCmd to a full path above, this just
+    # confirms it actually runs; if we came from winget, this is
+    # doing the real detection work via PATH.)
+    Write-Step "Verifying Python works after install"
+    if ($PythonCmd -and (Test-Path $PythonCmd -ErrorAction SilentlyContinue)) {
+        $verOutput = & $PythonCmd --version 2>&1
+        if ($LASTEXITCODE -ne 0 -or $verOutput -notmatch "^Python \d+\.\d+") {
+            $PythonCmd = $null
+        }
+    } else {
+        $PythonCmd = Find-RealPython
+    }
+
     if (-not $PythonCmd) {
         Write-Fail "Still cannot find a working Python after installation."
-        Write-Host "Try closing this PowerShell window, opening a NEW one, and re-running this script" -ForegroundColor Yellow
-        Write-Host "(PATH changes sometimes need a fresh session to take effect)." -ForegroundColor Yellow
+        Write-Host "    This usually means: close this PowerShell window, open a NEW one," -ForegroundColor Yellow
+        Write-Host "    and re-run this script - PATH changes from an installer often need a" -ForegroundColor Yellow
+        Write-Host "    fresh session to be visible, even though the install itself succeeded." -ForegroundColor Yellow
         exit 1
     }
     $ver = & $PythonCmd --version 2>&1
@@ -306,6 +353,12 @@ if ($TestRun) {
 
 Write-Host ""
 Write-Host "Setup complete on this machine ($env:COMPUTERNAME)." -ForegroundColor Cyan
-Write-Host "To run the initializer manually later:" -ForegroundColor Cyan
+Write-Host "To run the initializer manually later, in a NEW PowerShell window:" -ForegroundColor Cyan
 Write-Host "    cd `"$ScriptDir`"" -ForegroundColor White
-Write-Host "    $PythonCmd sct0m0_init_raw.py" -ForegroundColor White
+Write-Host "    & `"$PythonCmd`" sct0m0_init_raw.py" -ForegroundColor White
+Write-Host ""
+Write-Host "Note: if Python was just installed by this script, a NEW PowerShell" -ForegroundColor Yellow
+Write-Host "window will be needed for the plain 'python' command to work normally -" -ForegroundColor Yellow
+Write-Host "this is standard Windows behavior (PATH changes need a fresh session)," -ForegroundColor Yellow
+Write-Host "not something wrong with the install. This script itself already" -ForegroundColor Yellow
+Write-Host "worked around that for everything it just did." -ForegroundColor Yellow
