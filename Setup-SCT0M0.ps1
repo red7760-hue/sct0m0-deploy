@@ -1,28 +1,26 @@
 <#
 .SYNOPSIS
     Sets up this machine to run sct0m0_init_raw.py / sct0m0_protocol.py,
-    installing Python itself if it isn't already present.
+    installing Python 3.13 via winget if it isn't already present.
 
 .DESCRIPTION
     Run this AFTER copying sct0m0_init_raw.py and sct0m0_protocol.py onto
     the machine and placing Setup-SCT0M0.ps1 in the SAME folder as those
-    two files. You do NOT need to pre-install Python - this script will
-    fetch and silently install it if needed, using whichever of the
-    following is available on this machine, in order:
+    two files.
 
-        1. winget (Windows Package Manager) - preferred, built into
-           Windows 11 / recent Windows 10 / Server 2025.
-        2. Direct download of the official python.org installer
-           (requires internet access, which you've confirmed exists
-           at the site) - used if winget isn't available.
+    Requires winget to be present on the machine (built into Windows 11
+    and recent Windows 10 / Server 2025 by default). If winget isn't
+    available, this script will tell you and stop rather than guessing
+    at an alternative.
 
-    Then it:
-        3. Installs pyserial via pip.
-        4. Verifies both required .py files are present.
-        5. Optionally runs a connection smoke test (-TestRun switch).
-
-    No GitHub, no package registry account, nothing beyond
-    python.org / Microsoft's own winget repository is contacted.
+    Steps performed:
+        1. Install Python 3.13 via "winget install Python.Python.3.13"
+           (skipped if a working Python is already present).
+        2. Confirm python.exe actually exists on disk afterward (don't
+           just trust winget's exit code).
+        3. Install pyserial via pip.
+        4. Verify both required .py files are present and compile.
+        5. Optionally run a connection smoke test (-TestRun switch).
 
 .USAGE
     Just set up (no hardware test):
@@ -31,26 +29,31 @@
     Set up AND immediately try connecting to the device:
         .\Setup-SCT0M0.ps1 -TestRun
 
-    Force a specific Python version via direct download (skips winget):
-        .\Setup-SCT0M0.ps1 -ForceDirectDownload -PythonVersion 3.12.10
-
 .NOTES
-    - Must be run from an ELEVATED PowerShell window (Run as Administrator)
-      if Python needs to be installed system-wide. If you skip elevation,
-      a per-user install will be attempted instead.
+    - Run from an ELEVATED PowerShell window (Run as Administrator) for
+      a machine-wide install. Without elevation, winget installs for the
+      current user only.
     - If you get an "execution of scripts is disabled" error, run this
       once first (as the same user):
           Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+    - This script works around the one real gotcha with winget+Python:
+      a brand new PATH entry is NOT visible in the terminal that did the
+      installing (PowerShell caches environment variables for the life
+      of the session - this is normal Windows behavior, not a bug). The
+      script handles this for itself by finding python.exe directly on
+      disk and using its full path, so you don't need to reopen
+      PowerShell partway through. You WILL still need a new PowerShell
+      window afterward if you want to type a bare "python" command later.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$TestRun,
-    [switch]$ForceDirectDownload,
-    [string]$PythonVersion = "3.12.10"
+    [switch]$TestRun
 )
 
 $ErrorActionPreference = "Stop"
+
+$PythonPackageId = "Python.Python.3.13"
 
 function Write-Step($msg) {
     Write-Host ""
@@ -71,6 +74,46 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Find-RealPython {
+    # Guards against Windows Store "App Execution Alias" stubs, which
+    # exist on PATH but don't run real Python (they may silently open
+    # the Store, or print nothing useful, instead of a version string).
+    foreach ($candidate in @("py", "python", "python3")) {
+        $found = Get-Command $candidate -ErrorAction SilentlyContinue
+        if (-not $found) { continue }
+        $verOutput = & $candidate --version 2>&1
+        if ($LASTEXITCODE -eq 0 -and $verOutput -match "^Python \d+\.\d+") {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Find-PythonExeOnDisk {
+    # After a winget install, search the well-known install locations
+    # directly rather than relying on PATH (which won't be refreshed in
+    # this terminal session - see .NOTES above). python.exe lives
+    # directly inside the versioned folder (e.g. ...\Python313\python.exe),
+    # so each glob below just needs to resolve the folder, then check
+    # for the exe inside it - no recursion needed.
+    $searchGlobs = @(
+        "C:\Program Files\Python3*",
+        "C:\Program Files (x86)\Python3*",
+        "$env:LOCALAPPDATA\Programs\Python\Python3*"
+    )
+    $candidates = foreach ($glob in $searchGlobs) {
+        Get-ChildItem -Path $glob -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $exePath = Join-Path $_.FullName "python.exe"
+            if (Test-Path $exePath) {
+                Get-Item $exePath
+            }
+        }
+    }
+    $found = $candidates | Sort-Object FullName -Descending | Select-Object -First 1
+    if ($found) { return $found.FullName }
+    return $null
+}
+
 # ----------------------------------------------------------------------
 # 0. Resolve script directory
 # ----------------------------------------------------------------------
@@ -82,24 +125,25 @@ $IsAdmin = Test-IsAdmin
 Write-Host "Running elevated: $IsAdmin"
 
 # ----------------------------------------------------------------------
-# 1. Look for an existing, real Python interpreter
+# 1. Confirm winget exists - this script does not fall back to anything
+#    else, by design.
 # ----------------------------------------------------------------------
-function Find-RealPython {
-    foreach ($candidate in @("py", "python", "python3")) {
-        $found = Get-Command $candidate -ErrorAction SilentlyContinue
-        if (-not $found) { continue }
-
-        # Guard against Windows Store "App Execution Alias" stubs, which
-        # exist on PATH but don't run real Python (they may silently
-        # open the Store, or print nothing useful).
-        $verOutput = & $candidate --version 2>&1
-        if ($LASTEXITCODE -eq 0 -and $verOutput -match "^Python \d+\.\d+") {
-            return $candidate
-        }
-    }
-    return $null
+Write-Step "Checking for winget"
+$wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
+if (-not $wingetCmd) {
+    Write-Fail "winget was not found on this machine."
+    Write-Host ""
+    Write-Host "winget ships with Windows 11 and recent Windows 10 by default." -ForegroundColor Yellow
+    Write-Host "On older or Server builds, install 'App Installer' from the Microsoft" -ForegroundColor Yellow
+    Write-Host "Store, or see https://aka.ms/getwinget for manual install options." -ForegroundColor Yellow
+    exit 1
 }
+Write-Ok "winget is available"
 
+# ----------------------------------------------------------------------
+# 2. Look for an existing, real Python interpreter - skip install if
+#    one already works.
+# ----------------------------------------------------------------------
 Write-Step "Looking for an existing Python install"
 $PythonCmd = Find-RealPython
 
@@ -107,175 +151,72 @@ if ($PythonCmd) {
     $ver = & $PythonCmd --version 2>&1
     Write-Ok "Found working Python: '$PythonCmd' -> $ver"
 } else {
-    Write-Host "    No working Python found - will install one." -ForegroundColor Yellow
+    Write-Host "    No working Python found - installing $PythonPackageId via winget." -ForegroundColor Yellow
 
-    # ------------------------------------------------------------------
-    # 1a. Try winget first
-    # ------------------------------------------------------------------
-    $wingetAvailable = $false
-    if (-not $ForceDirectDownload) {
-        Write-Step "Checking for winget"
-        $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
-        if ($wingetCmd) {
-            Write-Ok "winget is available"
-            $wingetAvailable = $true
-        } else {
-            Write-Host "    winget not found on this machine." -ForegroundColor Yellow
-        }
-    }
+    # winget can hang on its very first run waiting for an interactive
+    # Y/N on source agreements, even with --accept-source-agreements
+    # (a known winget quirk, not a bug in this script). Run it as a
+    # background job with a hard timeout so an unattended machine never
+    # gets stuck waiting forever for input it can't provide.
+    Write-Step "Installing $PythonPackageId via winget"
 
-    if ($wingetAvailable) {
-        Write-Step "Installing Python via winget"
+    $wingetJob = Start-Job -ScriptBlock {
+        param($PackageId)
+        winget install --id $PackageId --source winget --exact `
+            --accept-package-agreements --accept-source-agreements `
+            --disable-interactivity --silent
+        return $LASTEXITCODE
+    } -ArgumentList $PythonPackageId
 
-        # winget can hang waiting for an interactive Y/N on source
-        # agreements if this is its very first run on the machine, even
-        # with --accept-source-agreements (this is a known winget quirk
-        # in unattended contexts, not a bug in this script). We run it as
-        # a background job with a hard timeout so an unattended site
-        # never gets stuck waiting forever - if it doesn't finish in
-        # time, we kill it and fall back to direct download instead.
-        $wingetJob = Start-Job -ScriptBlock {
-            winget install --id Python.Python.3.12 --source winget `
-                --accept-package-agreements --accept-source-agreements `
-                --disable-interactivity --silent
-            return $LASTEXITCODE
-        }
-
-        $finished = Wait-Job $wingetJob -Timeout 180
-        if (-not $finished) {
-            $timeoutMsg = "winget did not finish within 3 minutes (likely stuck on a " +
-                "first-run prompt it can't show in this unattended session) - " +
-                "stopping it and falling back to direct download."
-            Write-Fail $timeoutMsg
-            Stop-Job $wingetJob -ErrorAction SilentlyContinue
-            Remove-Job $wingetJob -Force -ErrorAction SilentlyContinue
-            $wingetAvailable = $false
-        } else {
-            $wingetExit = Receive-Job $wingetJob
-            Remove-Job $wingetJob -Force -ErrorAction SilentlyContinue
-            if ($wingetExit -ne 0) {
-                Write-Fail "winget install failed (exit $wingetExit) - will fall back to direct download."
-                $wingetAvailable = $false
-            } else {
-                Write-Ok "winget install completed"
-                # winget installs into a fresh PATH entry - refresh this
-                # process's view of PATH from the registry so we can find
-                # it without needing a new PowerShell session.
-                $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-                $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-                $env:Path = "$machinePath;$userPath"
-            }
-        }
-    }
-
-    # ------------------------------------------------------------------
-    # 1b. Fall back to direct download from python.org if winget
-    #     wasn't available or failed.
-    # ------------------------------------------------------------------
-    if (-not $wingetAvailable) {
-        Write-Step "Downloading Python $PythonVersion directly from python.org"
-
-        $installerUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"
-        $installerPath = Join-Path $env:TEMP "python-$PythonVersion-amd64.exe"
-
-        try {
-            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
-            Write-Ok "Downloaded installer to $installerPath"
-        } catch {
-            Write-Fail "Could not download Python installer from $installerUrl : $_"
-            Write-Host ""
-            Write-Host "Check internet access at this site, or manually download Python from" -ForegroundColor Yellow
-            Write-Host "https://www.python.org/downloads/windows/ and install it, then re-run this script." -ForegroundColor Yellow
-            exit 1
-        }
-
-        # Install to a FIXED, known location instead of the installer's
-        # default (which varies between per-user/per-machine and between
-        # Windows versions). Knowing the exact path lets us verify the
-        # install actually completed by checking the filesystem directly,
-        # rather than trusting PATH - which is the part that was failing.
-        if ($IsAdmin) {
-            $TargetDir = "C:\Python$($PythonVersion -replace '\.','')"
-            $installArgs = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 TargetDir=`"$TargetDir`""
-        } else {
-            Write-Host "    Not running elevated - installing for current user only." -ForegroundColor Yellow
-            $TargetDir = "$env:LOCALAPPDATA\Programs\Python\Python$($PythonVersion -replace '\.','')"
-            $installArgs = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 TargetDir=`"$TargetDir`""
-        }
-
-        Write-Step "Installing Python $PythonVersion silently to $TargetDir"
-        $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            Write-Fail "Python installer exited with code $($proc.ExitCode)."
-            exit 1
-        }
-
-        # The installer .exe can return before its internal MSI sub-install
-        # has actually finished writing files (a known quirk with this
-        # installer). Poll the filesystem for python.exe directly, rather
-        # than trusting the exit code or PATH, with a generous timeout.
-        $expectedExe = Join-Path $TargetDir "python.exe"
-        Write-Step "Waiting for $expectedExe to appear on disk"
-        $deadline = (Get-Date).AddSeconds(120)
-        while (-not (Test-Path $expectedExe) -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 2
-        }
-
-        if (-not (Test-Path $expectedExe)) {
-            Write-Fail "python.exe did not appear at $expectedExe within 2 minutes of install finishing."
-            Write-Host "    The installer reported success but the file isn't there yet (or installed elsewhere)." -ForegroundColor Yellow
-            Write-Host "    Check Programs and Features / Apps to see if Python actually installed, and where." -ForegroundColor Yellow
-            exit 1
-        }
-        Write-Ok "Confirmed python.exe exists at $expectedExe"
-
-        # Use the FULL PATH directly for the rest of THIS script run.
-        # This deliberately bypasses PATH/$env:Path entirely, because
-        # PowerShell caches environment variables for the life of the
-        # session - a freshly-written registry PATH value is not
-        # guaranteed to be visible in this process no matter how we
-        # try to refresh it. A new PATH entry only reliably takes
-        # effect in a NEW PowerShell window, but we don't want this
-        # script to require that, so we just use the known full path.
-        $PythonCmd = $expectedExe
-
-        Remove-Item $installerPath -ErrorAction SilentlyContinue
-    } else {
-        # winget path: re-detect via PATH as before, since winget
-        # typically installs through the Store/App Execution Alias
-        # mechanism rather than a fixed directory we can predict.
-        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $env:Path = "$machinePath;$userPath"
-    }
-
-    # Re-check for Python now that something was installed.
-    # (If we just set $PythonCmd to a full path above, this just
-    # confirms it actually runs; if we came from winget, this is
-    # doing the real detection work via PATH.)
-    Write-Step "Verifying Python works after install"
-    if ($PythonCmd -and (Test-Path $PythonCmd -ErrorAction SilentlyContinue)) {
-        $verOutput = & $PythonCmd --version 2>&1
-        if ($LASTEXITCODE -ne 0 -or $verOutput -notmatch "^Python \d+\.\d+") {
-            $PythonCmd = $null
-        }
-    } else {
-        $PythonCmd = Find-RealPython
-    }
-
-    if (-not $PythonCmd) {
-        Write-Fail "Still cannot find a working Python after installation."
-        Write-Host "    This usually means: close this PowerShell window, open a NEW one," -ForegroundColor Yellow
-        Write-Host "    and re-run this script - PATH changes from an installer often need a" -ForegroundColor Yellow
-        Write-Host "    fresh session to be visible, even though the install itself succeeded." -ForegroundColor Yellow
+    $finished = Wait-Job $wingetJob -Timeout 180
+    if (-not $finished) {
+        Stop-Job $wingetJob -ErrorAction SilentlyContinue
+        Remove-Job $wingetJob -Force -ErrorAction SilentlyContinue
+        Write-Fail "winget did not finish within 3 minutes."
+        Write-Host "    This usually means it's stuck on a first-run prompt it can't show" -ForegroundColor Yellow
+        Write-Host "    in this unattended session. Try running 'winget list' once manually" -ForegroundColor Yellow
+        Write-Host "    on this machine (interactively) to accept any source agreements," -ForegroundColor Yellow
+        Write-Host "    then re-run this script." -ForegroundColor Yellow
         exit 1
     }
+
+    $wingetExit = Receive-Job $wingetJob
+    Remove-Job $wingetJob -Force -ErrorAction SilentlyContinue
+    if ($wingetExit -ne 0) {
+        Write-Fail "winget install failed (exit code $wingetExit)."
+        exit 1
+    }
+    Write-Ok "winget reported a successful install"
+
+    # Don't just trust winget's exit code - confirm python.exe actually
+    # exists on disk, polling briefly in case of any write-finalization
+    # delay, then use its FULL PATH directly rather than relying on
+    # PATH/$env:Path (which will not be refreshed in this terminal
+    # session no matter what we do - that's normal Windows behavior).
+    Write-Step "Confirming python.exe exists on disk"
+    $deadline = (Get-Date).AddSeconds(60)
+    $foundExe = $null
+    while (-not $foundExe -and (Get-Date) -lt $deadline) {
+        $foundExe = Find-PythonExeOnDisk
+        if (-not $foundExe) { Start-Sleep -Seconds 2 }
+    }
+
+    if (-not $foundExe) {
+        Write-Fail "winget reported success, but no python.exe was found in the expected locations."
+        Write-Host "    Checked: C:\Program Files\Python3*, C:\Program Files (x86)\Python3*," -ForegroundColor Yellow
+        Write-Host "    and $env:LOCALAPPDATA\Programs\Python\Python3*" -ForegroundColor Yellow
+        Write-Host "    Open a NEW PowerShell window and try 'winget list $PythonPackageId'" -ForegroundColor Yellow
+        Write-Host "    to see where it actually installed, if anywhere." -ForegroundColor Yellow
+        exit 1
+    }
+
+    $PythonCmd = $foundExe
     $ver = & $PythonCmd --version 2>&1
-    Write-Ok "Python now available: '$PythonCmd' -> $ver"
+    Write-Ok "Confirmed working Python: '$PythonCmd' -> $ver"
 }
 
 # ----------------------------------------------------------------------
-# 2. Confirm pip is available, then install pyserial
+# 3. Confirm pip is available, then install pyserial
 # ----------------------------------------------------------------------
 Write-Step "Checking pip"
 & $PythonCmd -m pip --version | Out-Null
@@ -302,7 +243,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Ok "pyserial version $importCheck importable"
 
 # ----------------------------------------------------------------------
-# 3. Confirm required script files are present
+# 4. Confirm required script files are present
 # ----------------------------------------------------------------------
 Write-Step "Checking required files"
 
@@ -325,7 +266,7 @@ if ($missing.Count -gt 0) {
 }
 
 # ----------------------------------------------------------------------
-# 4. Syntax-check both files compile cleanly on this machine's Python
+# 5. Syntax-check both files compile cleanly on this machine's Python
 # ----------------------------------------------------------------------
 Write-Step "Verifying script files compile"
 foreach ($f in $RequiredFiles) {
@@ -338,7 +279,7 @@ foreach ($f in $RequiredFiles) {
 }
 
 # ----------------------------------------------------------------------
-# 5. Optional: actually try connecting to the device
+# 6. Optional: actually try connecting to the device
 # ----------------------------------------------------------------------
 if ($TestRun) {
     Write-Step "Running sct0m0_init_raw.py against the device"
@@ -355,10 +296,8 @@ Write-Host ""
 Write-Host "Setup complete on this machine ($env:COMPUTERNAME)." -ForegroundColor Cyan
 Write-Host "To run the initializer manually later, in a NEW PowerShell window:" -ForegroundColor Cyan
 Write-Host "    cd `"$ScriptDir`"" -ForegroundColor White
-Write-Host "    & `"$PythonCmd`" sct0m0_init_raw.py" -ForegroundColor White
+Write-Host "    python sct0m0_init_raw.py" -ForegroundColor White
 Write-Host ""
-Write-Host "Note: if Python was just installed by this script, a NEW PowerShell" -ForegroundColor Yellow
-Write-Host "window will be needed for the plain 'python' command to work normally -" -ForegroundColor Yellow
-Write-Host "this is standard Windows behavior (PATH changes need a fresh session)," -ForegroundColor Yellow
-Write-Host "not something wrong with the install. This script itself already" -ForegroundColor Yellow
-Write-Host "worked around that for everything it just did." -ForegroundColor Yellow
+Write-Host "(A NEW window is needed if Python was just installed by this script -" -ForegroundColor Yellow
+Write-Host "PATH changes need a fresh PowerShell session to be visible. This script" -ForegroundColor Yellow
+Write-Host "already worked around that for everything it just did.)" -ForegroundColor Yellow
