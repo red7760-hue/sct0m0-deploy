@@ -75,15 +75,27 @@ function Test-IsAdmin {
 }
 
 function Find-RealPython {
-    # Guards against Windows Store "App Execution Alias" stubs, which
-    # exist on PATH but don't run real Python (they may silently open
-    # the Store, or print nothing useful, instead of a version string).
+    # Guards against Windows Store "App Execution Alias" stubs. These
+    # exist on PATH (Get-Command finds them) but aren't real Python -
+    # running one throws a terminating-style error ("Python was not
+    # found; run without arguments to install from the Microsoft
+    # Store...") rather than just failing quietly. With
+    # $ErrorActionPreference = "Stop" set globally, that error would
+    # otherwise kill this whole script, so we explicitly catch it here
+    # and treat it the same as "this candidate doesn't work, try the
+    # next one" - which is exactly what should happen.
     foreach ($candidate in @("py", "python", "python3")) {
         $found = Get-Command $candidate -ErrorAction SilentlyContinue
         if (-not $found) { continue }
-        $verOutput = & $candidate --version 2>&1
-        if ($LASTEXITCODE -eq 0 -and $verOutput -match "^Python \d+\.\d+") {
-            return $candidate
+
+        try {
+            $verOutput = & $candidate --version 2>&1
+            if ($LASTEXITCODE -eq 0 -and $verOutput -match "^Python \d+\.\d+") {
+                return $candidate
+            }
+        } catch {
+            # Store alias stub or similar - not a real Python, skip it.
+            continue
         }
     }
     return $null
