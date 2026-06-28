@@ -42,7 +42,7 @@ $ErrorActionPreference = "Stop"
 # ----------------------------------------------------------------------
 # EDIT THESE TWO VALUES for your repo
 # ----------------------------------------------------------------------
-$GitHubUser = "YOURUSERNAME"
+$GitHubUser = "red7760-hue"
 $GitHubRepo = "sct0m0-deploy"
 $Branch     = "main"
 
